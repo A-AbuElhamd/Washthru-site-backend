@@ -1,0 +1,1130 @@
+// WashThru backend database schema.
+//
+// 28 tables across three PostgreSQL schemas (decision #6):
+//   cms   content the dashboard edits and the public site reads
+//   ops   operational data — leads and the audit trail
+//   auth  accounts and sessions
+//
+// The split is a least-privilege boundary: the public site's database role can
+// be granted SELECT on `cms` and INSERT on `ops.contact_submissions` only.
+// Free to set up now, awkward to retrofit later.
+//
+// CONVENTIONS USED THROUGHOUT
+// ---------------------------
+// * Models are PascalCase and map to snake_case tables; fields are camelCase and
+//   map to snake_case columns. TypeScript stays idiomatic, SQL stays idiomatic.
+// * Bilingual content is sibling columns (`titleAr` / `titleEn`), never a
+//   translations table — decision #4, confirmed there will never be a third
+//   language. A child table would add a join to every read for no benefit.
+// * `id` is a UUID primary key; `slug` is a SEPARATE unique column (rule 1).
+//   This fixes a live bug where `id: payload.slug || crypto.randomUUID()` let a
+//   duplicate slug create a duplicate primary key.
+// * Soft delete via `deletedAt`, paired with partial unique indexes so a deleted
+//   row does not hold its slug hostage (rule 4).
+// * `createdBy` / `updatedBy` are plain UUID columns, NOT Prisma relations.
+//   Modelling them as relations would need ~50 named relations back to User for
+//   a field that is never joined on ("everything Ahmed edited" is a rare query,
+//   and rule 5c deliberately skips indexing them). `ops.audit_log` is the real
+//   record of who changed what.
+// * Image and PDF fields ARE real relations to `MediaAsset` (rule 17). They are
+//   joined on every read, and the foreign key stops a file that is still in use
+//   from being deleted into a broken image on the live site.
+
+generator client {
+  provider = "prisma-client-js"
+
+  // Partial indexes (`@@unique([...], where: raw("deleted_at IS NULL"))`) are
+  // still behind a preview flag in Prisma 7.10, despite the documentation
+  // describing them as generally available.
+  //
+  // They are not optional here: rule 4 pairs soft delete with partial unique
+  // indexes so a deleted row stops reserving its slug. Without them, deleting a
+  // product would permanently block anyone from reusing that slug.
+  previewFeatures = ["partialIndexes"]
+}
+
+// NOTE: there is deliberately no `url` here.
+//
+// Prisma 7 removed `url` from the datasource block. The connection string for
+// the CLI (migrate, studio, db pull) now lives in `prisma.config.ts` at the
+// repo root, and the runtime client gets its connection through a driver
+// adapter constructed in `src/prisma.ts`.
+//
+// Almost every tutorial still shows `url = env("DATABASE_URL")` here, and it
+// fails validation with error P1012 on Prisma 7.
+datasource db {
+  provider = "postgresql"
+  schemas  = ["auth", "cms", "ops"]
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+//
+// Native Postgres enums for the closed unions that already exist in the
+// dashboard's TypeScript (rule 9). A typo becomes a database error instead of a
+// blank icon or a broken filter on the live site.
+//
+// Prisma enum VALUES must be valid identifiers, so the kebab-case strings the
+// frontend uses are carried through with @map.
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  admin
+  editor
+
+  @@map("user_role")
+  @@schema("auth")
+}
+
+enum MediaKind {
+  image
+  pdf
+
+  @@map("media_kind")
+  @@schema("cms")
+}
+
+enum ContentStatus {
+  draft
+  published
+
+  @@map("content_status")
+  @@schema("cms")
+}
+
+/// Blueprints are the one content type stored one row per language rather than
+/// with sibling columns, so they need an explicit locale.
+enum Locale {
+  ar
+  en
+
+  @@map("locale")
+  @@schema("cms")
+}
+
+enum AuditAction {
+  create
+  update
+  delete
+
+  @@map("audit_action")
+  @@schema("ops")
+}
+
+enum ContactRequestType {
+  inquiry
+  complaint
+  consultation
+  purchase
+  maintenance
+
+  @@map("contact_request_type")
+  @@schema("ops")
+}
+
+enum ProductCategory {
+  touchless
+  rollover
+  tunnel
+
+  @@map("product_category")
+  @@schema("cms")
+}
+
+/// All five values are seeded even though four currently have no articles —
+/// the six news items that carried the other categories were deleted from the
+/// site. The schema should not narrow itself to today's content.
+enum NewsCategory {
+  productLaunches        @map("product-launches")
+  partnershipsContracts  @map("partnerships-contracts")
+  exhibitionsEvents      @map("exhibitions-events")
+  achievementsExpansions @map("achievements-expansions")
+  inMedia                @map("in-media")
+
+  @@map("news_category")
+  @@schema("cms")
+}
+
+enum BlueprintPlanType {
+  station
+  serviceCenter @map("service-center")
+
+  @@map("blueprint_plan_type")
+  @@schema("cms")
+}
+
+enum BlueprintStreetConfig {
+  oneStreet           @map("one-street")
+  twoStreetsBefore    @map("two-streets-before")
+  twoStreetsAfter     @map("two-streets-after")
+  twoStreetsBehind    @map("two-streets-behind")
+  threeStreetsBefore  @map("three-streets-before")
+  threeStreetsAfter   @map("three-streets-after")
+  threeStreetsBehind  @map("three-streets-behind")
+  fourStreets         @map("four-streets")
+
+  @@map("blueprint_street_config")
+  @@schema("cms")
+}
+
+/// Icon names rather than data, but a closed set in the dashboard's TypeScript,
+/// so they get the same protection.
+enum ServiceIcon {
+  ClipboardList
+  Ruler
+  HardHat
+  GraduationCap
+  Calculator
+  Headphones
+  Wrench
+  RefreshCcw
+
+  @@map("service_icon")
+  @@schema("cms")
+}
+
+enum ValueIcon {
+  Award
+  Lightbulb
+  HeartHandshake
+
+  @@map("value_icon")
+  @@schema("cms")
+}
+
+// ---------------------------------------------------------------------------
+// auth — accounts and sessions
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email        String   @db.VarChar(255)
+  passwordHash String   @map("password_hash") @db.Text
+  name         String   @db.VarChar(200)
+
+  /// Present but NOT enforced anywhere yet (decision #12). Every user is
+  /// effectively an admin today. The column exists because adding it now is one
+  /// line, whereas adding it later is a migration plus a backfill plus an audit
+  /// of every endpoint. The likely first use is restricting
+  /// `ops.contact_submissions`, which holds customer names, phones and emails.
+  role UserRole @default(editor)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  refreshTokens RefreshToken[]
+  auditEntries  AuditLog[]
+  uploads       MediaAsset[]
+
+  /// Partial unique: a deleted user must not keep their address reserved.
+  @@unique([email], where: raw("deleted_at IS NULL"), map: "users_email_active_key")
+  @@map("users")
+  @@schema("auth")
+}
+
+/// One row per issued refresh token.
+///
+/// This table is what makes logout and revocation possible at all. A JWT is
+/// valid until it expires and the server cannot take it back, so the access
+/// token is kept short (~15 min) and the long-lived half lives here — deleting
+/// the row ends the session (decision #12).
+model RefreshToken {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+
+  /// The token's HASH, never the token itself. A stolen database backup must not
+  /// hand over working sessions.
+  tokenHash String @unique @map("token_hash") @db.Text
+
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Hit on every token refresh — Postgres does not index foreign keys itself.
+  @@index([userId])
+  @@map("refresh_tokens")
+  @@schema("auth")
+}
+
+// ---------------------------------------------------------------------------
+// ops — inbound data and the audit trail
+// ---------------------------------------------------------------------------
+
+/// Contact form submissions.
+///
+/// The only table here holding real customer personal data, and the only one
+/// written by anonymous public visitors. Nothing in it is bilingual — it is
+/// inbound data, not content.
+///
+/// ⚠️ PDPL: name, phone and email are personal data. These values must never be
+/// written to logs (decision #15, rule 3).
+model ContactSubmission {
+  id          String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  requestType ContactRequestType @map("request_type")
+
+  name  String @db.VarChar(200)
+  city  String @db.VarChar(120)
+  phone String @db.VarChar(40)
+  email String @db.VarChar(255)
+
+  /// Was `'yes' | 'no'` in the dashboard's TypeScript; a two-value string union
+  /// is just a boolean wearing a hat.
+  hasCarWash Boolean @map("has_car_wash")
+
+  /// Optional on the real form, so genuinely nullable.
+  message String? @db.Text
+
+  submittedAt DateTime @default(now()) @map("submitted_at") @db.Timestamptz(3)
+
+  /// The dashboard lists newest first, and this table grows forever.
+  @@index([submittedAt(sort: Desc)])
+  @@map("contact_submissions")
+  @@schema("ops")
+}
+
+/// Who changed what, and what it looked like before.
+///
+/// `before` / `after` as jsonb is the one place in this schema where jsonb is
+/// unambiguously correct: the shape genuinely varies by table (rule 8).
+model AuditLog {
+  id        String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tableName String      @map("table_name") @db.VarChar(120)
+  recordId  String      @map("record_id") @db.Uuid
+  action    AuditAction
+
+  before Json? @db.JsonB
+  after  Json? @db.JsonB
+
+  actorId   String?  @map("actor_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  /// "History of this record" and "what changed recently" are the two queries
+  /// this table exists to answer.
+  @@index([tableName, recordId])
+  @@index([createdAt(sort: Desc)])
+  @@index([actorId])
+  @@map("audit_log")
+  @@schema("ops")
+}
+
+// ---------------------------------------------------------------------------
+// cms — shared infrastructure
+// ---------------------------------------------------------------------------
+
+/// Every image and PDF in the system.
+///
+/// Binaries are NEVER stored in Postgres (rule 7) — the bytes live in Azure Blob
+/// Storage and this table holds the path plus metadata.
+///
+/// `blobPath` stores the path WITHIN the container, not a full URL. Storing full
+/// URLs is what makes a CDN or domain change a rewrite of every row; storing
+/// paths makes it a config change. The API composes the URL on read.
+///
+/// This table replaces the 218 files currently served from a Webflow CDN
+/// WashThru does not own, and the PDF "uploads" that are browser blob URLs and
+/// die on refresh.
+model MediaAsset {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  blobPath String @unique @map("blob_path") @db.VarChar(500)
+
+  /// The name the file was uploaded with — this is `ImageFileRef.fileName`,
+  /// which the dashboard already displays.
+  originalFilename String    @map("original_filename") @db.VarChar(400)
+  mimeType         String    @map("mime_type") @db.VarChar(120)
+  sizeBytes        BigInt    @map("size_bytes")
+  kind             MediaKind
+
+  /// Images only; null for PDFs.
+  width  Int?
+  height Int?
+
+  /// Paths to the generated sizes (thumb / card / full). Kept as jsonb rather
+  /// than three columns because the set of sizes is a rendering decision that
+  /// may change, and a change of shape should not require a migration.
+  variants Json? @db.JsonB
+
+  /// Content hash, so re-uploading the same file can be detected.
+  checksum String? @db.VarChar(128)
+
+  uploadedBy String?   @map("uploaded_by") @db.Uuid
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  deletedAt  DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  uploader User? @relation(fields: [uploadedBy], references: [id], onDelete: SetNull)
+
+  // Back-relations. Verbose, but each one is a real foreign key that stops a
+  // file still in use from being deleted into a broken image.
+  homeFeatureIcons        HomeFeature[]          @relation("HomeFeatureIcon")
+  homeFeatureBackgrounds  HomeFeature[]          @relation("HomeFeatureBackground")
+  homeTestimonialIcons    HomeTestimonial[]      @relation("HomeTestimonialIcon")
+  homePartnerImages       HomePartner[]          @relation("HomePartnerImage")
+  teamMemberPhotos        TeamMember[]           @relation("TeamMemberPhoto")
+  productHeroImages       Product[]              @relation("ProductHeroImage")
+  productPdfsAr           Product[]              @relation("ProductPdfAr")
+  productPdfsEn           Product[]              @relation("ProductPdfEn")
+  productCarouselImages   ProductCarouselImage[] @relation("ProductCarouselImage")
+  serviceItemIcons        ServiceItem[]          @relation("ServiceItemIcon")
+  serviceItemBackgrounds  ServiceItem[]          @relation("ServiceItemBackground")
+  knowledgePdfsAr         KnowledgeResource[]    @relation("KnowledgePdfAr")
+  knowledgePdfsEn         KnowledgeResource[]    @relation("KnowledgePdfEn")
+  blueprintImages         BlueprintPlan[]        @relation("BlueprintImage")
+  blueprintDrawings       BlueprintPlan[]        @relation("BlueprintDrawing")
+  blueprintFooterCovers   BlueprintPlan[]        @relation("BlueprintFooterCover")
+  blueprintPdfs           BlueprintPlan[]        @relation("BlueprintPdf")
+  blogCoverImages         BlogPost[]             @relation("BlogCoverImage")
+  newsCoverImages         NewsArticle[]          @relation("NewsCoverImage")
+
+  @@index([uploadedBy])
+  @@map("media_assets")
+  @@schema("cms")
+}
+
+/// All one-row page copy blocks, in ONE table (decision #7).
+///
+/// The dashboard has 11 `useFieldStore` blocks — home hero, who-we-are teaser,
+/// product highlights, and a hero for each of products / wash-cloud /
+/// knowledge-library / blueprints / blog / news / contact-us.
+///
+/// Option 1 of the original design gave each its own table: 10 tables holding
+/// exactly one row forever, and a migration every time a piece of copy changed
+/// shape. This is 11 rows instead, with `content` holding the exact
+/// `LocalizedText` tree the dashboard's TypeScript already uses — so there is no
+/// conversion layer to learn.
+model PageContent {
+  id    String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// e.g. "home", "products", "blog"
+  page  String @db.VarChar(80)
+  /// e.g. "hero", "whoWeAreTeaser", "productHighlights"
+  block String @db.VarChar(80)
+
+  content Json @db.JsonB
+
+  updatedBy String?  @map("updated_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([page, block])
+  @@map("page_content")
+  @@schema("cms")
+}
+
+// ---------------------------------------------------------------------------
+// cms — home page
+//
+// These list tables carry `sortOrder`, which is net-new: the dashboard has no
+// ordering at all today. They do NOT carry `status` / `publishedAt` — per rule 3
+// those belong only to the five real content types (products, blog, news,
+// blueprints, knowledge resources).
+// ---------------------------------------------------------------------------
+
+model HomeFeature {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  descriptionAr String @map("description_ar") @db.Text
+  descriptionEn String @map("description_en") @db.Text
+
+  iconId            String? @map("icon_id") @db.Uuid
+  backgroundImageId String? @map("background_image_id") @db.Uuid
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  icon            MediaAsset? @relation("HomeFeatureIcon", fields: [iconId], references: [id], onDelete: Restrict)
+  backgroundImage MediaAsset? @relation("HomeFeatureBackground", fields: [backgroundImageId], references: [id], onDelete: Restrict)
+
+  @@map("home_features")
+  @@schema("cms")
+}
+
+model HomeService {
+  id            String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  titleAr       String      @map("title_ar") @db.VarChar(300)
+  titleEn       String      @map("title_en") @db.VarChar(300)
+  descriptionAr String      @map("description_ar") @db.Text
+  descriptionEn String      @map("description_en") @db.Text
+  icon          ServiceIcon
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  @@map("home_services")
+  @@schema("cms")
+}
+
+model HomeTestimonial {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  /// Single-value: a person's name is not translated. Note this is deliberately
+  /// inconsistent with `BlogPost.authorName`, which IS bilingual — rule 16 says
+  /// follow the existing data rather than normalising it.
+  name String @db.VarChar(200)
+
+  quoteAr String @map("quote_ar") @db.Text
+  quoteEn String @map("quote_en") @db.Text
+  iconId  String? @map("icon_id") @db.Uuid
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  icon MediaAsset? @relation("HomeTestimonialIcon", fields: [iconId], references: [id], onDelete: Restrict)
+
+  @@map("home_testimonials")
+  @@schema("cms")
+}
+
+/// A partner is a logo and a position. That is genuinely the whole record.
+model HomePartner {
+  id      String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  imageId String? @map("image_id") @db.Uuid
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  image MediaAsset? @relation("HomePartnerImage", fields: [imageId], references: [id], onDelete: Restrict)
+
+  @@map("home_partners")
+  @@schema("cms")
+}
+
+// ---------------------------------------------------------------------------
+// cms — who we are
+// ---------------------------------------------------------------------------
+
+model CompanyValue {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  titleAr       String    @map("title_ar") @db.VarChar(300)
+  titleEn       String    @map("title_en") @db.VarChar(300)
+  descriptionAr String    @map("description_ar") @db.Text
+  descriptionEn String    @map("description_en") @db.Text
+  icon          ValueIcon
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  @@map("company_values")
+  @@schema("cms")
+}
+
+model CompanyMilestone {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  /// Text, not an integer — the existing data is free-form and a range like
+  /// "2019–2020" must stay valid.
+  year String @db.VarChar(40)
+
+  descriptionAr String @map("description_ar") @db.Text
+  descriptionEn String @map("description_en") @db.Text
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  @@map("company_milestones")
+  @@schema("cms")
+}
+
+/// No icon field — goals do not have one.
+model CompanyGoal {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  descriptionAr String @map("description_ar") @db.Text
+  descriptionEn String @map("description_en") @db.Text
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  @@map("company_goals")
+  @@schema("cms")
+}
+
+model TeamMember {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  /// Single-value: a person's name is not translated. The job TITLE is.
+  name    String  @db.VarChar(200)
+  titleAr String  @map("title_ar") @db.VarChar(300)
+  titleEn String  @map("title_en") @db.VarChar(300)
+  photoId String? @map("photo_id") @db.Uuid
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  photo MediaAsset? @relation("TeamMemberPhoto", fields: [photoId], references: [id], onDelete: Restrict)
+
+  @@map("team_members")
+  @@schema("cms")
+}
+
+// ---------------------------------------------------------------------------
+// cms — products
+// ---------------------------------------------------------------------------
+
+/// The three product categories and their page copy. Three rows, forever.
+///
+/// This one is filed as a `useFieldStore` in the dashboard, which made it look
+/// like page copy — but it holds `Record<ProductCategory, ProductCategoryContent>`,
+/// i.e. three keyed rows each with a nested list. It is structurally a table.
+model ProductCategoryContent {
+  id       String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  category ProductCategory @unique
+
+  titleAr     String @map("title_ar") @db.VarChar(300)
+  titleEn     String @map("title_en") @db.VarChar(300)
+  typeLabelAr String @map("type_label_ar") @db.VarChar(200)
+  typeLabelEn String @map("type_label_en") @db.VarChar(200)
+
+  descriptionAr String @map("description_ar") @db.Text
+  descriptionEn String @map("description_en") @db.Text
+
+  expandedTitleAr       String @map("expanded_title_ar") @db.VarChar(300)
+  expandedTitleEn       String @map("expanded_title_en") @db.VarChar(300)
+  expandedDescriptionAr String @map("expanded_description_ar") @db.Text
+  expandedDescriptionEn String @map("expanded_description_en") @db.Text
+
+  /// Nested `CategoryItem[]` — title + description per item. Stays inside the
+  /// parent row (decision #7): nothing ever queries these across categories.
+  items Json @db.JsonB
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  @@map("product_categories")
+  @@schema("cms")
+}
+
+model Product {
+  id   String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Separate from `id` (rule 1). The live dashboard does
+  /// `id: payload.slug || crypto.randomUUID()`, which lets a duplicate slug
+  /// create a duplicate primary key. The unique index below is the fix.
+  slug String @db.VarChar(200)
+
+  category ProductCategory
+
+  titleAr     String @map("title_ar") @db.VarChar(300)
+  titleEn     String @map("title_en") @db.VarChar(300)
+  subtitleAr  String @map("subtitle_ar") @db.VarChar(400)
+  subtitleEn  String @map("subtitle_en") @db.VarChar(400)
+  typeLabelAr String @map("type_label_ar") @db.VarChar(200)
+  typeLabelEn String @map("type_label_en") @db.VarChar(200)
+
+  /// Multi-paragraph, blank-line joined — as the site already stores it.
+  descriptionAr String @map("description_ar") @db.Text
+  descriptionEn String @map("description_en") @db.Text
+
+  heroImageId String? @map("hero_image_id") @db.Uuid
+
+  /// Was `pdfUrl: LocalizedText` — a bilingual URL *string*. Now two real
+  /// foreign keys (rule 17), matching how knowledge-library PDFs are modelled.
+  pdfArId String? @map("pdf_ar_id") @db.Uuid
+  pdfEnId String? @map("pdf_en_id") @db.Uuid
+
+  /// Nested lists that stay in the parent row: they are edited as a block on the
+  /// product form and never queried across products. `quickInfo` items have no
+  /// id at all, so nothing is lost by inlining them.
+  quickInfo Json @map("quick_info") @db.JsonB
+  videos    Json @db.JsonB
+
+  status      ContentStatus @default(draft)
+  publishedAt DateTime?     @map("published_at") @db.Timestamptz(3)
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  heroImage MediaAsset? @relation("ProductHeroImage", fields: [heroImageId], references: [id], onDelete: Restrict)
+  pdfAr     MediaAsset? @relation("ProductPdfAr", fields: [pdfArId], references: [id], onDelete: Restrict)
+  pdfEn     MediaAsset? @relation("ProductPdfEn", fields: [pdfEnId], references: [id], onDelete: Restrict)
+
+  testimonials   ProductTestimonial[]
+  carouselImages ProductCarouselImage[]
+
+  @@unique([slug], where: raw("deleted_at IS NULL"), map: "products_slug_active_key")
+  @@index([status, publishedAt(sort: Desc)])
+  @@map("products")
+  @@schema("cms")
+}
+
+/// The "+" in "Option 3+".
+///
+/// The ONLY nested list promoted to its own table, because it is the only one
+/// the public site queries ACROSS records: `getAllProductTestimonials()` feeds
+/// the reviews section on /our-products by pulling testimonials from every
+/// product at once. That is impossible if they are buried in each product row.
+model ProductTestimonial {
+  id        String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId String @map("product_id") @db.Uuid
+
+  /// Single-value, like the home-page testimonials.
+  name    String @db.VarChar(200)
+  quoteAr String @map("quote_ar") @db.Text
+  quoteEn String @map("quote_en") @db.Text
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@map("product_testimonials")
+  @@schema("cms")
+}
+
+/// A product's carousel photos, as rows rather than an array of ids in jsonb.
+///
+/// Chosen deliberately. As jsonb, adding one photo means rewriting the whole
+/// array: a drag-reorder rewrites everything, and two people editing at once
+/// silently overwrite each other. As a table it is an ordinary ordered list, so
+/// it registers against the generic CRUD layer (decision #8) and gets
+/// add / remove / reorder for free instead of hand-written endpoints.
+///
+/// It also restores the foreign key, so a photo still in use cannot be deleted
+/// into a broken image on the live site.
+model ProductCarouselImage {
+  id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId    String @map("product_id") @db.Uuid
+  mediaAssetId String @map("media_asset_id") @db.Uuid
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  product Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+  media   MediaAsset @relation("ProductCarouselImage", fields: [mediaAssetId], references: [id], onDelete: Restrict)
+
+  /// Joined on every product read; Postgres does not index foreign keys itself.
+  @@index([productId])
+  @@index([mediaAssetId])
+  @@map("product_carousel_images")
+  @@schema("cms")
+}
+
+// ---------------------------------------------------------------------------
+// cms — services, wash cloud, knowledge library
+// ---------------------------------------------------------------------------
+
+model ServiceItem {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  titleAr       String @map("title_ar") @db.VarChar(300)
+  titleEn       String @map("title_en") @db.VarChar(300)
+  descriptionAr String @map("description_ar") @db.Text
+  descriptionEn String @map("description_en") @db.Text
+
+  iconId       String? @map("icon_id") @db.Uuid
+  backgroundId String? @map("background_id") @db.Uuid
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  icon       MediaAsset? @relation("ServiceItemIcon", fields: [iconId], references: [id], onDelete: Restrict)
+  background MediaAsset? @relation("ServiceItemBackground", fields: [backgroundId], references: [id], onDelete: Restrict)
+
+  @@map("service_items")
+  @@schema("cms")
+}
+
+/// The simplest table in the schema: a bilingual title and description.
+model WashCloudFeature {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  titleAr       String @map("title_ar") @db.VarChar(300)
+  titleEn       String @map("title_en") @db.VarChar(300)
+  descriptionAr String @map("description_ar") @db.Text
+  descriptionEn String @map("description_en") @db.Text
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  @@map("wash_cloud_features")
+  @@schema("cms")
+}
+
+model KnowledgeResource {
+  id            String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  titleAr       String @map("title_ar") @db.VarChar(300)
+  titleEn       String @map("title_en") @db.VarChar(300)
+  descriptionAr String @map("description_ar") @db.Text
+  descriptionEn String @map("description_en") @db.Text
+  coverTextAr   String @map("cover_text_ar") @db.VarChar(300)
+  coverTextEn   String @map("cover_text_en") @db.VarChar(300)
+
+  /// A genuinely different PDF per language, not one shared file — so two
+  /// foreign keys rather than one.
+  pdfArId String? @map("pdf_ar_id") @db.Uuid
+  pdfEnId String? @map("pdf_en_id") @db.Uuid
+
+  /// How many leading words of the title render in the accent colour.
+  highlightWords Int @default(0) @map("highlight_words")
+
+  status      ContentStatus @default(draft)
+  publishedAt DateTime?     @map("published_at") @db.Timestamptz(3)
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  pdfAr MediaAsset? @relation("KnowledgePdfAr", fields: [pdfArId], references: [id], onDelete: Restrict)
+  pdfEn MediaAsset? @relation("KnowledgePdfEn", fields: [pdfEnId], references: [id], onDelete: Restrict)
+
+  @@map("knowledge_resources")
+  @@schema("cms")
+}
+
+// ---------------------------------------------------------------------------
+// cms — blueprints
+// ---------------------------------------------------------------------------
+
+/// The one content type that is NOT bilingual per field.
+///
+/// The dashboard's own type comment says it: "unlike every other content type in
+/// this dashboard, a plan is NOT bilingual per field... `locale` picks which
+/// language this specific plan's text is written in." So it is one row per
+/// language, keyed on (slug, locale) — matching `content/blueprints/{locale}/`.
+///
+/// All six existing plans are Arabic. English blueprints do not exist yet; the
+/// unique key already supports adding them later with no migration.
+///
+/// Note the blueprints HERO *is* bilingual — it lives in `page_content`, so the
+/// two do not get confused.
+model BlueprintPlan {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug   String @db.VarChar(200)
+  locale Locale
+
+  /// Plain columns, not `_ar` / `_en` — see the note above.
+  title String @db.VarChar(300)
+  intro String @db.Text
+
+  planNumber       String @map("plan_number") @db.VarChar(80)
+  measurementLabel String @map("measurement_label") @db.VarChar(200)
+  areaLabel        String @map("area_label") @db.VarChar(200)
+  ideaLabel        String @map("idea_label") @db.VarChar(200)
+
+  planType     BlueprintPlanType     @map("plan_type")
+  streetConfig BlueprintStreetConfig @map("street_config")
+
+  sketchfabEmbedUrl String? @map("sketchfab_embed_url") @db.VarChar(1000)
+
+  imageId            String? @map("image_id") @db.Uuid
+  drawingImageId     String? @map("drawing_image_id") @db.Uuid
+  footerCoverImageId String? @map("footer_cover_image_id") @db.Uuid
+  pdfId              String? @map("pdf_id") @db.Uuid
+
+  /// Nested feature list — title, description and image per feature. No ids, so
+  /// nothing is lost by keeping it in the parent row.
+  features Json @db.JsonB
+
+  status      ContentStatus @default(draft)
+  publishedAt DateTime?     @map("published_at") @db.Timestamptz(3)
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  image            MediaAsset? @relation("BlueprintImage", fields: [imageId], references: [id], onDelete: Restrict)
+  drawingImage     MediaAsset? @relation("BlueprintDrawing", fields: [drawingImageId], references: [id], onDelete: Restrict)
+  footerCoverImage MediaAsset? @relation("BlueprintFooterCover", fields: [footerCoverImageId], references: [id], onDelete: Restrict)
+  pdf              MediaAsset? @relation("BlueprintPdf", fields: [pdfId], references: [id], onDelete: Restrict)
+
+  @@unique([slug, locale], where: raw("deleted_at IS NULL"), map: "blueprint_plans_slug_locale_active_key")
+  @@index([status, publishedAt(sort: Desc)])
+  @@map("blueprint_plans")
+  @@schema("cms")
+}
+
+// ---------------------------------------------------------------------------
+// cms — after-sale
+// ---------------------------------------------------------------------------
+
+model WarrantyItem {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  leadAr String @map("lead_ar") @db.Text
+  leadEn String @map("lead_en") @db.Text
+  restAr String @map("rest_ar") @db.Text
+  restEn String @map("rest_en") @db.Text
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  @@map("warranty_items")
+  @@schema("cms")
+}
+
+/// The four fixed pricing tiers.
+///
+/// ⚠️ EVERY OPTIONAL FIELD HERE IS GENUINELY NULLABLE (rule 12).
+///
+/// The dashboard currently uses an empty pair `{ ar: '', en: '' }` to mean
+/// "nothing" — no tagline, no bonus, or a "Contact us" tier with no price.
+/// Carried across as empty strings, every "is this set?" check would silently
+/// pass. The migration must convert those to real NULLs.
+model PlanTier {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  nameLine1Ar String @map("name_line1_ar") @db.VarChar(200)
+  nameLine1En String @map("name_line1_en") @db.VarChar(200)
+  nameLine2Ar String @map("name_line2_ar") @db.VarChar(200)
+  nameLine2En String @map("name_line2_en") @db.VarChar(200)
+
+  taglineAr String? @map("tagline_ar") @db.VarChar(400)
+  taglineEn String? @map("tagline_en") @db.VarChar(400)
+
+  priceMonthlyAr      String? @map("price_monthly_ar") @db.VarChar(120)
+  priceMonthlyEn      String? @map("price_monthly_en") @db.VarChar(120)
+  priceAnnualAr       String? @map("price_annual_ar") @db.VarChar(120)
+  priceAnnualEn       String? @map("price_annual_en") @db.VarChar(120)
+  priceAnnualStrikeAr String? @map("price_annual_strike_ar") @db.VarChar(120)
+  priceAnnualStrikeEn String? @map("price_annual_strike_en") @db.VarChar(120)
+
+  bonusMonthlyAr String? @map("bonus_monthly_ar") @db.Text
+  bonusMonthlyEn String? @map("bonus_monthly_en") @db.Text
+  bonusAnnualAr  String? @map("bonus_annual_ar") @db.Text
+  bonusAnnualEn  String? @map("bonus_annual_en") @db.Text
+
+  /// Feature rows (text plus an optional detail popover) and the discount list.
+  /// Both edited as a block on the tier form, never queried across tiers.
+  features  Json @db.JsonB
+  discounts Json @db.JsonB
+
+  highlighted Boolean @default(false)
+
+  sortOrder Int       @map("sort_order")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  @@map("plan_tiers")
+  @@schema("cms")
+}
+
+// ---------------------------------------------------------------------------
+// cms — blog, news and tags
+//
+// Written against a fresh audit of both repositories (2026-09-17). Note the
+// site stores these as one file per locale with a `(slug, locale)` key, while
+// the dashboard stores them bilingually. The sibling-column form below follows
+// the dashboard, since that is what edits the data; the API splits them per
+// locale on the way out.
+// ---------------------------------------------------------------------------
+
+model BlogPost {
+  id   String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug String @db.VarChar(250)
+
+  /// These four, plus `slug` and `publishedAt`, are the only fields the
+  /// dashboard actually validates — so they are the honest NOT NULL set.
+  /// Everything else is nullable by design, not by oversight.
+  titleAr       String @map("title_ar") @db.VarChar(400)
+  titleEn       String @map("title_en") @db.VarChar(400)
+  descriptionAr String @map("description_ar") @db.Text
+  descriptionEn String @map("description_en") @db.Text
+
+  /// One cover image shared across both languages; the ALT TEXT is per-language.
+  coverImageId    String? @map("cover_image_id") @db.Uuid
+  coverImageAltAr String? @map("cover_image_alt_ar") @db.VarChar(500)
+  coverImageAltEn String? @map("cover_image_alt_en") @db.VarChar(500)
+
+  /// Bilingual in shape, but in practice always the brand ("واش ثرو" /
+  /// "WashThru") — never a person. Kept bilingual because that is what the data
+  /// is (rule 16).
+  authorNameAr String? @map("author_name_ar") @db.VarChar(200)
+  authorNameEn String? @map("author_name_en") @db.VarChar(200)
+
+  /// DATE, not timestamptz: every value in both repositories is `YYYY-MM-DD`
+  /// with no time and no timezone. Storing it as a timestamp would invent a
+  /// midnight that then shifts around by timezone.
+  publishedAt DateTime @map("published_at") @db.Date
+
+  /// The editorial "last updated" date. Named to avoid colliding with the
+  /// `updatedAt` audit column. Empty on all 19 dashboard posts and absent from
+  /// all 38 site files, but the site DOES read it for SEO `dateModified`.
+  contentUpdatedAt DateTime? @map("content_updated_at") @db.Date
+
+  /// The only bilingual pair of NUMBERS in the schema. They genuinely differ on
+  /// 13 of 19 posts, so a single shared column would be wrong.
+  ///
+  /// ⚠️ Recompute these from the real HTML during migration — six posts carry
+  /// 1–2 minutes because their bodies were empty when the seed was generated.
+  readingMinutesAr Int? @map("reading_minutes_ar")
+  readingMinutesEn Int? @map("reading_minutes_en")
+
+  noindex Boolean @default(false)
+
+  contentHtmlAr String? @map("content_html_ar") @db.Text
+  contentHtmlEn String? @map("content_html_en") @db.Text
+
+  status ContentStatus @default(draft)
+
+  sortOrder Int       @map("sort_order") @default(0)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  coverImage MediaAsset?   @relation("BlogCoverImage", fields: [coverImageId], references: [id], onDelete: Restrict)
+  tags       BlogPostTag[]
+
+  @@unique([slug], where: raw("deleted_at IS NULL"), map: "blog_posts_slug_active_key")
+  /// Exactly the blog index page's query.
+  @@index([status, publishedAt(sort: Desc)])
+  @@map("blog_posts")
+  @@schema("cms")
+}
+
+model NewsArticle {
+  id   String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug String @db.VarChar(250)
+
+  titleAr   String @map("title_ar") @db.VarChar(400)
+  titleEn   String @map("title_en") @db.VarChar(400)
+  excerptAr String @map("excerpt_ar") @db.Text
+  excerptEn String @map("excerpt_en") @db.Text
+
+  category NewsCategory
+
+  coverImageId    String? @map("cover_image_id") @db.Uuid
+  coverImageAltAr String? @map("cover_image_alt_ar") @db.VarChar(500)
+  coverImageAltEn String? @map("cover_image_alt_en") @db.VarChar(500)
+
+  /// DATE, as with blog posts.
+  publishedAt DateTime @map("published_at") @db.Date
+
+  /// Drives the top carousel instead of the card grid. No current article sets
+  /// it — both that did were among the six deleted from the site — but the
+  /// column stays, because the schema should not narrow to today's content.
+  featured Boolean @default(false)
+
+  /// ⚠️ These bodies embed their own images: inline-styled gallery divs with
+  /// hardcoded `<img src="/images/news/<slug>/….png">`. The Webflow migration
+  /// must rewrite images INSIDE this HTML, not just the cover image column.
+  contentHtmlAr String? @map("content_html_ar") @db.Text
+  contentHtmlEn String? @map("content_html_en") @db.Text
+
+  status ContentStatus @default(draft)
+
+  sortOrder Int       @map("sort_order") @default(0)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  coverImage MediaAsset? @relation("NewsCoverImage", fields: [coverImageId], references: [id], onDelete: Restrict)
+
+  @@unique([slug], where: raw("deleted_at IS NULL"), map: "news_articles_slug_active_key")
+  @@index([status, publishedAt(sort: Desc)])
+  /// The index page's tab bar filters on this.
+  @@index([category])
+  @@map("news_articles")
+  @@schema("cms")
+}
+
+/// Blog tags.
+///
+/// The dashboard edits these as a comma-separated string today, which is why
+/// near-duplicates have accumulated (`car-wash` vs `car-wash-business`,
+/// `technology` vs `car-wash-technology`). Canonicalise before seeding — merging
+/// is cheap now and becomes a data migration once join rows point at them.
+///
+/// `slug` is the English kebab-case identifier used in the content files. The
+/// labels are nullable because tags are not displayed anywhere yet — they feed
+/// related-post matching and OG `article:tag` meta only.
+model Tag {
+  id      String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug    String  @unique @db.VarChar(120)
+  labelAr String? @map("label_ar") @db.VarChar(200)
+  labelEn String? @map("label_en") @db.VarChar(200)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  posts BlogPostTag[]
+
+  @@map("tags")
+  @@schema("cms")
+}
+
+/// Join table (rule 6).
+model BlogPostTag {
+  blogPostId String @map("blog_post_id") @db.Uuid
+  tagId      String @map("tag_id") @db.Uuid
+
+  blogPost BlogPost @relation(fields: [blogPostId], references: [id], onDelete: Cascade)
+  tag      Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([blogPostId, tagId])
+  /// The composite primary key already indexes `blogPostId`; this side needs its
+  /// own index for "find every post with this tag".
+  @@index([tagId])
+  @@map("blog_post_tags")
+  @@schema("cms")
+}
+

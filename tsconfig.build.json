@@ -1,0 +1,15 @@
+{
+  // Production build config — `pnpm build`.
+  //
+  // Narrows to `src` and turns emitting back on. Tests and config files are
+  // excluded so they never reach `dist/`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "declaration": false
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "tests", "*.config.ts"]
+}

@@ -1,0 +1,49 @@
+{
+  // Base config — used by the editor and by `pnpm typecheck`.
+  // It covers BOTH src and tests, so test files are typechecked too.
+  //
+  // `pnpm build` uses tsconfig.build.json instead, which narrows to src and
+  // adds the output settings. Keeping them separate means tests are type-safe
+  // without ending up in the shipped bundle.
+  "compilerOptions": {
+    // --- Module system -------------------------------------------------
+    // This project is ESM ("type": "module" in package.json). Prisma 7 and
+    // much of the modern Node ecosystem are ESM-first, so we follow suit.
+    //
+    // NOTE: with NodeNext, relative imports must carry a `.js` extension even
+    // though the source file is `.ts` — e.g. `import { createApp } from './app.js'`.
+    // That looks wrong but is correct: the extension refers to the *compiled*
+    // output, which is what Node actually loads. TypeScript resolves it back to
+    // the `.ts` file. Vitest understands this too, so tests need no special case.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2023",
+    "lib": ["ES2023"],
+
+    // --- Strictness ----------------------------------------------------
+    // All on. This codebase is maintained by a frontend developer learning
+    // backend work; the compiler catching mistakes is cheaper than runtime
+    // debugging against a live database.
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": true,
+
+    // --- Interop -------------------------------------------------------
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+
+    // Typecheck only; emitting is tsconfig.build.json's job.
+    "noEmit": true,
+
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts", "*.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

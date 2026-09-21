@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment — never commit real secrets. `.env.example` IS committed.
+.env
+.env.local
+.env.*.local
+
+# Test + coverage artefacts
+coverage/
+.vitest/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs — we log to stdout (decision #15), so any log file here is accidental
+*.log
