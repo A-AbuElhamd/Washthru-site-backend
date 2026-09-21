@@ -220,6 +220,18 @@ describe('list', () => {
     const live = await api.get('/api/products?status=published').expect(200)
     expect(live.body.total).toBe(1)
     expect(live.body.data[0].slug).toBe('live-one')
+
+    // And the other direction.
+    const drafts = await api.get('/api/products?status=draft').expect(200)
+    expect(drafts.body.total).toBe(1)
+    expect(drafts.body.data[0].slug).toBe('draft-one')
+  })
+
+  it('rejects an unrecognised status rather than ignoring it', async () => {
+    // `?status=pubished` (typo) used to be ignored silently, returning drafts
+    // while appearing to filter — the worst possible outcome for a public page.
+    const res = await api.get('/api/products?status=pubished').expect(400)
+    expect(res.body.error.fields[0].field).toBe('status')
   })
 })
 
@@ -372,5 +384,179 @@ describe('reorder', () => {
       .patch('/api/wash-cloud-features/reorder/all')
       .send({ ids: 'not-an-array' })
       .expect(400)
+  })
+
+  // The three below were all 500s before the audit. Bad client input must
+  // produce a 4xx naming the problem — a 500 says "the service is broken", sends
+  // the caller looking in the wrong place, and pages whoever is on call.
+  it('rejects an id that does not exist with 400, not 500', async () => {
+    const res = await api
+      .patch('/api/wash-cloud-features/reorder/all')
+      .send({ ids: ['11111111-1111-1111-1111-111111111111'] })
+      .expect(400)
+
+    expect(res.body.error.code).toBe('VALIDATION_FAILED')
+    expect(res.body.error.fields[0].message).toMatch(/No wash cloud feature with id/)
+  })
+
+  it('rejects a malformed id with 400, not 500', async () => {
+    // Comparing a uuid column to text that is not a UUID is a Postgres type
+    // error, so this has to be caught before the query.
+    const res = await api
+      .patch('/api/wash-cloud-features/reorder/all')
+      .send({ ids: ['not-a-uuid'] })
+      .expect(400)
+
+    expect(res.body.error.fields[0].message).toMatch(/is not a valid id/)
+  })
+
+  it('rejects duplicate ids', async () => {
+    // Previously accepted with 204 while the last occurrence silently won, so
+    // the caller was told an order had been applied that never was.
+    const created = await api
+      .post('/api/wash-cloud-features')
+      .send(feature())
+      .expect(201)
+
+    const res = await api
+      .patch('/api/wash-cloud-features/reorder/all')
+      .send({ ids: [created.body.id, created.body.id] })
+      .expect(400)
+
+    expect(res.body.error.fields[0].message).toMatch(/duplicates/)
+  })
+
+  it('refuses to reorder a deleted row', async () => {
+    const created = await api.post('/api/wash-cloud-features').send(feature()).expect(201)
+    await api.delete(`/api/wash-cloud-features/${created.body.id}`).expect(204)
+
+    await api
+      .patch('/api/wash-cloud-features/reorder/all')
+      .send({ ids: [created.body.id] })
+      .expect(400)
+  })
+})
+
+describe('PATCH does not write fields it was not given', () => {
+  // ⚠️ THE MOST SERIOUS BUG FOUND IN THE AUDIT.
+  //
+  // Joi's `.optional()` does NOT strip a `.default()`, so the forked update
+  // schema still injected `quickInfo: []`, `videos: []` and `status: 'draft'`.
+  // An editor fixing a typo silently wiped a product's spec table and videos AND
+  // un-published it from the live site — returning 200.
+  //
+  // It passed unnoticed because the existing "changes only the fields sent" test
+  // used wash-cloud-features, whose schema has no defaults.
+  it('preserves nested lists when updating one unrelated field', async () => {
+    const created = await api
+      .post('/api/products')
+      .send(
+        product({
+          quickInfo: [{ labelAr: 'ط', labelEn: 'Power', valueAr: '١٠', valueEn: '10' }],
+          videos: [{ titleAr: 'ف', titleEn: 'Demo', youtubeId: 'abc123' }],
+          status: 'published',
+        }),
+      )
+      .expect(201)
+
+    await api.patch(`/api/products/${created.body.id}`).send({ titleEn: 'RF V1' }).expect(200)
+
+    const row = await prisma.product.findUnique({ where: { id: created.body.id } })
+    expect(row?.titleEn).toBe('RF V1')
+    expect(row?.quickInfo).toHaveLength(1) // not wiped
+    expect(row?.videos).toHaveLength(1) // not wiped
+    expect(row?.status).toBe('published') // not un-published
+  })
+
+  it('rejects an empty PATCH body on a schema with defaults', async () => {
+    // The same root cause defeated `.min(1)`: defaults made the validated object
+    // non-empty, so an empty body returned 200 and performed the wipe above.
+    const created = await api.post('/api/products').send(product()).expect(201)
+
+    const res = await api.patch(`/api/products/${created.body.id}`).send({}).expect(400)
+    expect(res.body.error.fields[0].message).toMatch(/at least one field/)
+  })
+})
+
+describe('client mistakes return 4xx, not 500', () => {
+  it('rejects a title longer than the column allows', async () => {
+    // Joi's max was 400 while the column is VARCHAR(300), so a 350-character
+    // title passed validation and Postgres rejected it — a 500 for valid-looking
+    // input.
+    const res = await api
+      .post('/api/products')
+      .send(product({ titleEn: 'x'.repeat(350) }))
+      .expect(400)
+
+    expect(res.body.error.code).toBe('VALIDATION_FAILED')
+  })
+
+  it('rejects a reference to a media asset that does not exist', async () => {
+    // A well-formed but unknown UUID is a foreign-key violation (P2003), which
+    // used to escape as a 500.
+    const res = await api
+      .post('/api/products')
+      .send(product({ heroImageId: '11111111-1111-1111-1111-111111111111' }))
+
+    expect(res.status).toBe(409)
+    expect(res.body.error.code).toBe('CONFLICT')
+  })
+})
+
+describe('ordering is stable', () => {
+  it('does not reuse a sort order after a delete', async () => {
+    // `sortOrder = count` shrank on delete while existing rows kept their
+    // values, so the next create collided with an existing row. Tied rows then
+    // order unpredictably, and with paging a row can appear twice or not at all.
+    const ids: string[] = []
+    for (const name of ['A', 'B', 'C']) {
+      const res = await api
+        .post('/api/wash-cloud-features')
+        .send(feature({ titleEn: name }))
+        .expect(201)
+      ids.push(res.body.id)
+    }
+
+    await api.delete(`/api/wash-cloud-features/${ids[1]}`).expect(204)
+
+    const created = await api
+      .post('/api/wash-cloud-features')
+      .send(feature({ titleEn: 'D' }))
+      .expect(201)
+
+    const rows = await prisma.washCloudFeature.findMany({
+      where: { deletedAt: null },
+      select: { sortOrder: true },
+    })
+    const orders = rows.map((r) => r.sortOrder)
+    expect(new Set(orders).size).toBe(orders.length) // no duplicates
+    expect(created.body.sortOrder).toBe(3)
+  })
+})
+
+describe('audit columns', () => {
+  it('records who created and last updated a row', async () => {
+    // `actorId()` was a stub returning undefined, so these stayed null forever
+    // even after auth existed — leaving `created_by` / `updated_by` useless and
+    // decision #12's per-person accounts pointless.
+    const created = await api.post('/api/wash-cloud-features').send(feature()).expect(201)
+
+    const row = await prisma.washCloudFeature.findUnique({ where: { id: created.body.id } })
+    expect(row?.createdBy).not.toBeNull()
+    expect(row?.updatedBy).toBe(row?.createdBy)
+
+    const user = await prisma.user.findFirst()
+    expect(row?.createdBy).toBe(user?.id)
+  })
+
+  it('updates updated_by on edit', async () => {
+    const created = await api.post('/api/wash-cloud-features').send(feature()).expect(201)
+    await api
+      .patch(`/api/wash-cloud-features/${created.body.id}`)
+      .send({ titleEn: 'Edited' })
+      .expect(200)
+
+    const row = await prisma.washCloudFeature.findUnique({ where: { id: created.body.id } })
+    expect(row?.updatedBy).not.toBeNull()
   })
 })

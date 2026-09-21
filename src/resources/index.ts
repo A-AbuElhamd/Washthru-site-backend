@@ -21,7 +21,7 @@ import { DEFAULT_FEATURES, type ResourceConfig } from '../crud/types.js'
  * -------------------------------------------------------------------------- */
 
 /** A required Arabic/English pair, e.g. `title` → `titleAr` + `titleEn`. */
-function requiredPair(field: string, label: string, max = 400) {
+function requiredPair(field: string, label: string, max = 300) {
   return {
     [`${field}Ar`]: Joi.string().trim().max(max).required().messages({
       'any.required': `${label} (Arabic) is required`,

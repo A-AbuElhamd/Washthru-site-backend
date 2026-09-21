@@ -113,6 +113,25 @@ export function authRoutes(deps: Deps): Router {
       include: { user: true },
     })
 
+    // REUSE DETECTION. A token that was already revoked being presented again
+    // means two parties hold the same one — the legitimate user rotated it, and
+    // someone else kept a copy. The safe response is to end every session for
+    // that user, forcing a fresh login they control.
+    //
+    // Without this, a thief whose token loses the race simply gets a 401, the
+    // victim sees one "session expired", logs back in, and the thief keeps their
+    // own 30-day chain. The theft never surfaces.
+    if (stored && stored.revokedAt !== null) {
+      await deps.prisma.refreshToken.updateMany({
+        where: { userId: stored.userId, revokedAt: null },
+        data: { revokedAt: now },
+      })
+      req.log.warn('refresh token reuse detected — all sessions revoked', {
+        userId: stored.userId,
+      })
+      throw unauthorized('Session expired. Please sign in again')
+    }
+
     const usable =
       stored && stored.revokedAt === null && stored.expiresAt > now && stored.user.deletedAt === null
 
@@ -120,11 +139,23 @@ export function authRoutes(deps: Deps): Router {
       throw unauthorized('Session expired. Please sign in again')
     }
 
-    // Rotate: the presented token is spent.
-    await deps.prisma.refreshToken.update({
-      where: { id: stored.id },
+    // Rotate ATOMICALLY: revoke only if still unrevoked, and check we were the
+    // one who did it.
+    //
+    // ⚠️ Read-then-write is a race. Two concurrent refreshes with the same token
+    // both see `revokedAt === null` above and both issue a session — which is
+    // exactly the outcome rotation exists to prevent. `updateMany` with
+    // `revokedAt: null` in the WHERE makes the database arbitrate: one caller
+    // gets count 1, the other gets 0.
+    const claimed = await deps.prisma.refreshToken.updateMany({
+      where: { id: stored.id, revokedAt: null },
       data: { revokedAt: now },
     })
+
+    if (claimed.count !== 1) {
+      // Someone else spent this token in the same instant.
+      throw unauthorized('Session expired. Please sign in again')
+    }
 
     await issueSession(deps, res, stored.user)
 

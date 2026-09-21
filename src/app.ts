@@ -43,12 +43,29 @@ export function createApp(deps: Deps): Express {
   //    blocking everyone after five submissions, or nobody. It fails silently,
   //    which is what makes it easy to miss.
   //
-  //    `1` means "trust exactly one proxy hop", which is what App Service is.
-  //    Trusting all proxies would let a client forge its own IP via the header.
-  app.set('trust proxy', 1)
+  //    ⚠️ It cuts both ways, which is why it is CONFIGURATION rather than a
+  //    constant. Trusting a proxy that is not actually there is worse than not
+  //    trusting one: any client could then send its own `X-Forwarded-For` and
+  //    claim any IP it likes, defeating the rate limiter completely.
+  //
+  //    So: `TRUST_PROXY_HOPS=0` (the default) when running directly,
+  //    `TRUST_PROXY_HOPS=1` on Azure App Service.
+  app.set('trust proxy', deps.config.trustProxyHops)
 
   // 2. Don't advertise the framework. Free, and one less hint for an attacker.
   app.disable('x-powered-by')
+
+  //    Serialise BigInt as a string.
+  //
+  //    `res.json` uses JSON.stringify, which THROWS on a BigInt rather than
+  //    skipping it — so any row containing one returns a 500. `media_assets.
+  //    size_bytes` is a BigInt, so every read of the media library would fail
+  //    the day that table registers. A string avoids the other trap too:
+  //    JavaScript numbers lose precision above 2^53, so emitting it as a number
+  //    would silently corrupt large values.
+  app.set('json replacer', (_key: string, value: unknown) =>
+    typeof value === 'bigint' ? value.toString() : value,
+  )
 
   // 3. Request id + bound logger, before anything that might log or fail — so
   //    every later line, including errors, carries the id.

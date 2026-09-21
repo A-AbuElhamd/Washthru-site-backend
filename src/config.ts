@@ -29,6 +29,8 @@ export interface Config {
   logLevel: string
   /** Origins permitted to call this API. Never a wildcard — see below. */
   corsOrigins: string[]
+  /** Proxy hops to trust for X-Forwarded-For. 0 = no proxy. */
+  trustProxyHops: number
   /** PostgreSQL connection string for this process. */
   databaseUrl: string
   /** Secret used to sign access tokens. */
@@ -51,6 +53,7 @@ interface RawEnv {
   PORT: number
   LOG_LEVEL: string
   CORS_ORIGINS: string
+  TRUST_PROXY_HOPS: number
   DATABASE_URL: string
   JWT_SECRET: string
   ACCESS_TOKEN_TTL_SECONDS: number
@@ -91,7 +94,35 @@ const envSchema: Joi.ObjectSchema<RawEnv> = Joi.object({
   // default, so without it an explicitly empty `CORS_ORIGINS=` in a .env file
   // would crash the server at boot. Empty is legitimate — it means "no
   // cross-origin callers", which is correct for a same-origin deployment.
-  CORS_ORIGINS: Joi.string().allow('').default(''),
+  CORS_ORIGINS: Joi.string()
+    .allow('')
+    .default('')
+    // Required in production. Left empty there, the allowlist matches nothing,
+    // every browser request from the dashboard is blocked, and the only symptom
+    // is a CORS error in the browser console that says nothing about the cause.
+    // Failing at boot with a clear message is far cheaper to diagnose.
+    .when('NODE_ENV', {
+      is: 'production',
+      then: Joi.string().min(1).required().messages({
+        'any.required':
+          'CORS_ORIGINS is required in production. Set it to the dashboard and site origins, comma-separated.',
+        'string.empty':
+          'CORS_ORIGINS cannot be empty in production — no browser request would be allowed through.',
+      }),
+    }),
+
+  // Whether a reverse proxy sits in front of this process.
+  //
+  // ⚠️ Cuts both ways. Behind Azure App Service the real client IP arrives in
+  // `X-Forwarded-For`, and WITHOUT trusting the proxy every request looks like
+  // it came from the proxy — so the IP rate limiter would treat the whole
+  // internet as one client. But trusting a proxy that is NOT there is worse: any
+  // client can then forge `X-Forwarded-For` and claim any IP it likes, which
+  // defeats the rate limiter entirely.
+  //
+  // So it is configuration, not a constant. Default off (safe when running
+  // directly); set to 1 on Azure.
+  TRUST_PROXY_HOPS: Joi.number().integer().min(0).max(5).default(0),
 
   // Required, with no default. A server that cannot reach its database is
   // useless, so it should refuse to start and say so rather than begin serving
@@ -164,6 +195,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     corsOrigins: raw.CORS_ORIGINS.split(',')
       .map((origin) => origin.trim())
       .filter((origin) => origin.length > 0),
+    trustProxyHops: raw.TRUST_PROXY_HOPS,
     databaseUrl: raw.DATABASE_URL,
     jwtSecret: raw.JWT_SECRET,
     accessTokenTtlSeconds: raw.ACCESS_TOKEN_TTL_SECONDS,
