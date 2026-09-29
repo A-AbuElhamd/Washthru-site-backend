@@ -25,6 +25,7 @@ import {
   conflict,
   notFound,
   validationFailed,
+  type AppError,
   type FieldError,
 } from '../errors.js'
 import { paginate, parsePagination } from './pagination.js'
@@ -48,11 +49,33 @@ const UUID_PATTERN =
  * invalid fields together, so returning them one at a time would turn a single
  * bad save into three round trips.
  */
-function validate<T>(schema: Joi.ObjectSchema, payload: unknown): T {
+function validate<T>(
+  schema: Joi.ObjectSchema,
+  payload: unknown,
+  options: { applyDefaults: boolean },
+): T {
   const { error, value } = schema.validate(payload ?? {}, {
     abortEarly: false,
     stripUnknown: true,
     convert: true,
+
+    // ⚠️ THE MOST IMPORTANT LINE IN THIS FILE, for updates.
+    //
+    // Joi's `.optional()` does NOT remove a `.default()`. The update schema is
+    // built by forking the create schema to all-optional, so without this the
+    // defaults still fire on a PATCH:
+    //
+    //   PATCH /api/products/rf-v1 {"titleEn":"RF V1"}
+    //     validated => { titleEn, quickInfo: [], videos: [], status: 'draft' }
+    //
+    // An editor fixing a typo would silently wipe the product's spec table and
+    // video list AND un-publish it from the live site — returning 200. It also
+    // defeated `.min(1)`, since the validated object was never empty, so an
+    // empty PATCH body performed that same destructive write.
+    //
+    // Creates DO want defaults (a new product genuinely needs `quickInfo: []`,
+    // because the column is NOT NULL).
+    noDefaults: !options.applyDefaults,
   })
 
   if (error) {
@@ -66,14 +89,51 @@ function validate<T>(schema: Joi.ObjectSchema, payload: unknown): T {
   return value as T
 }
 
-/** True when a thrown value is Prisma's unique-constraint error. */
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    (error as { code: unknown }).code === PRISMA_UNIQUE_VIOLATION
-  )
+function prismaErrorCode(error: unknown): string | null {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return null
+  const code = (error as { code: unknown }).code
+  return typeof code === 'string' ? code : null
+}
+
+/**
+ * Turns a Prisma error into the right HTTP response.
+ *
+ * Every one of these is a CLIENT mistake. Left unmapped they escape as 500s,
+ * which tells the caller the service is broken, sends them looking in the wrong
+ * place, and pages whoever is on call for a bad request body.
+ *
+ * Returns `null` when the error is genuinely ours, so it can propagate to the
+ * error handler and be logged with its stack.
+ */
+function mapPrismaError(error: unknown, label: string): AppError | null {
+  switch (prismaErrorCode(error)) {
+    // Unique constraint — a duplicate slug. Comes from a real partial unique
+    // index in Postgres, not an application check that could drift.
+    case PRISMA_UNIQUE_VIOLATION:
+      return conflict(`A ${label.toLowerCase()} with those details already exists`)
+
+    // Value too long for the column. Reachable whenever a Joi `max()` is looser
+    // than the column width.
+    case 'P2000':
+      return validationFailed(
+        [{ field: 'body', message: 'One of the values is too long for its field' }],
+        'A value exceeds the maximum length',
+      )
+
+    // Foreign key violation — e.g. `heroImageId` pointing at a media asset that
+    // does not exist, or deleting a file another row still references.
+    case 'P2003':
+      return conflict(
+        'That references something which does not exist, or is still in use elsewhere',
+      )
+
+    // Record not found for an update/delete.
+    case 'P2025':
+      return notFound(`${label} not found`)
+
+    default:
+      return null
+  }
 }
 
 /**
@@ -86,9 +146,38 @@ function activeWhere(config: ResourceConfig): Record<string, unknown> {
   return config.features.softDelete ? { deletedAt: null } : {}
 }
 
-/** Orders by `sort_order` when the table has one, else newest first. */
-function defaultOrderBy(config: ResourceConfig): Record<string, unknown> {
-  return config.features.sortOrder ? { sortOrder: 'asc' } : { createdAt: 'desc' }
+/**
+ * Orders by `sort_order` when the table has one, else newest first.
+ *
+ * ⚠️ The `id` tiebreaker is not decoration. `sort_order` values can tie (two
+ * rows created concurrently, or after a delete shifts the count), and
+ * `created_at` ties easily in seed data at millisecond precision. With no
+ * tiebreaker, Postgres returns tied rows in whatever order it likes — and that
+ * order can differ between two identical requests, so with 20-row pages a row
+ * can appear on two pages or on neither.
+ */
+function defaultOrderBy(config: ResourceConfig): Record<string, unknown>[] {
+  return config.features.sortOrder
+    ? [{ sortOrder: 'asc' }, { id: 'asc' }]
+    : [{ createdAt: 'desc' }, { id: 'asc' }]
+}
+
+/**
+ * The next `sort_order` value — one past the current highest.
+ *
+ * NOT `count()`. Count shrinks when a row is soft-deleted while the remaining
+ * rows keep their original values, so: create A(0) B(1) C(2), delete B, create D
+ * → count is 2 → D collides with C. Ties then order unpredictably (see above).
+ */
+async function nextSortOrder(delegate: CrudDelegate, config: ResourceConfig): Promise<number> {
+  const last = await delegate.findFirst({
+    where: activeWhere(config),
+    orderBy: { sortOrder: 'desc' },
+    select: { sortOrder: true },
+  })
+
+  const highest = last?.['sortOrder']
+  return typeof highest === 'number' ? highest + 1 : 0
 }
 
 /**
@@ -116,9 +205,15 @@ async function findOne(
   })
 }
 
-/** Reads the actor's id from the request, once auth exists (Session 4). */
-function actorId(_req: Request): string | undefined {
-  return undefined
+/**
+ * The signed-in user's id, for the `created_by` / `updated_by` columns.
+ *
+ * Populated by `requireAuth`, which runs in front of every CRUD route. It is
+ * still optional here because `Request.user` is optional on the type — most
+ * routes in an Express app never set it.
+ */
+function actorId(req: Request): string | undefined {
+  return req.user?.id
 }
 
 export function createCrudRouter(config: ResourceConfig, deps: Deps): Router {
@@ -136,8 +231,27 @@ export function createCrudRouter(config: ResourceConfig, deps: Deps): Router {
 
     const where: Record<string, unknown> = { ...activeWhere(config) }
 
-    if (config.features.status && req.query['status'] === 'published') {
-      where['status'] = 'published'
+    // `?status=` filters on tables that have one. Omitted, everything is
+    // returned — drafts included — which is what the dashboard wants.
+    //
+    // ⚠️ The public site MUST pass `?status=published`. Omitting it there would
+    // publish unfinished drafts. Once a public read path exists, consider making
+    // that the default for unauthenticated callers rather than relying on every
+    // caller to remember.
+    if (config.features.status) {
+      const status = req.query['status']
+
+      if (status !== undefined) {
+        // An unrecognised value used to be ignored silently, so `?status=pubished`
+        // (typo) returned drafts while appearing to filter. Rejecting it means the
+        // caller finds out.
+        if (status !== 'draft' && status !== 'published') {
+          throw validationFailed([
+            { field: 'status', message: 'status must be "draft" or "published"' },
+          ])
+        }
+        where['status'] = status
+      }
     }
 
     // Count and page in parallel — they are independent queries.
@@ -166,13 +280,12 @@ export function createCrudRouter(config: ResourceConfig, deps: Deps): Router {
 
   /** CREATE. */
   router.post('/', async (req, res) => {
-    const data = validate<Row>(config.createSchema, req.body)
+    const data = validate<Row>(config.createSchema, req.body, { applyDefaults: true })
 
     if (config.features.sortOrder && data['sortOrder'] === undefined) {
       // Append to the end rather than defaulting to 0, where every new row would
       // land at the top in reverse order of creation.
-      const count = await delegate.count({ where: activeWhere(config) })
-      data['sortOrder'] = count
+      data['sortOrder'] = await nextSortOrder(delegate, config)
     }
 
     const actor = actorId(req)
@@ -188,9 +301,8 @@ export function createCrudRouter(config: ResourceConfig, deps: Deps): Router {
       // A duplicate slug is a client mistake, not a server fault — and this 409
       // comes from a real partial unique index in Postgres, not from a check in
       // application code that could drift out of sync.
-      if (isUniqueViolation(error)) {
-        throw conflict(`A ${config.label.toLowerCase()} with those details already exists`)
-      }
+      const mapped = mapPrismaError(error, config.label)
+      if (mapped) throw mapped
       throw error
     }
   })
@@ -202,7 +314,7 @@ export function createCrudRouter(config: ResourceConfig, deps: Deps): Router {
 
     if (!existing) throw notFound(`${config.label} not found`)
 
-    const data = validate<Row>(config.updateSchema, req.body)
+    const data = validate<Row>(config.updateSchema, req.body, { applyDefaults: false })
 
     const actor = actorId(req)
     if (actor) data['updatedBy'] = actor
@@ -214,9 +326,8 @@ export function createCrudRouter(config: ResourceConfig, deps: Deps): Router {
       })
       res.json(updated)
     } catch (error) {
-      if (isUniqueViolation(error)) {
-        throw conflict(`A ${config.label.toLowerCase()} with those details already exists`)
-      }
+      const mapped = mapPrismaError(error, config.label)
+      if (mapped) throw mapped
       throw error
     }
   })
@@ -268,11 +379,53 @@ export function createCrudRouter(config: ResourceConfig, deps: Deps): Router {
 
       const ids = body.ids as string[]
 
+      // Reject repeats before touching the database. Left alone, the last
+      // occurrence silently wins and the caller gets a 204 for an order that was
+      // never applied as sent.
+      if (new Set(ids).size !== ids.length) {
+        throw validationFailed([{ field: 'ids', message: 'ids must not contain duplicates' }])
+      }
+
+      // Check the FORMAT before querying. Postgres raises a type error when a
+      // uuid column is compared to text that is not a UUID, which would surface
+      // as a 500 rather than a 400 naming the bad value.
+      const malformed = ids.filter((id) => !UUID_PATTERN.test(id))
+      if (malformed.length > 0) {
+        throw validationFailed(
+          malformed.map((id) => ({ field: 'ids', message: `"${id}" is not a valid id` })),
+        )
+      }
+
+      // Verify every id exists and is not deleted, BEFORE the transaction.
+      //
+      // Without this, an unknown id — or a malformed one that is not even a UUID
+      // — reaches Prisma and throws, which the error handler reports as a 500.
+      // A caller sending bad input should get a 4xx naming the problem, not a
+      // server error suggesting the service is broken.
+      const existing = await delegate.findMany({
+        where: { ...activeWhere(config), id: { in: ids } },
+        select: { id: true },
+      })
+
+      if (existing.length !== ids.length) {
+        const found = new Set(existing.map((row) => row['id'] as string))
+        const missing = ids.filter((id) => !found.has(id))
+        throw validationFailed(
+          missing.map((id) => ({ field: 'ids', message: `No ${config.label.toLowerCase()} with id "${id}"` })),
+          'Some ids do not exist',
+        )
+      }
+
+      const actor = actorId(req)
+
       await (deps.prisma as unknown as {
         $transaction(operations: unknown[]): Promise<unknown>
       }).$transaction(
         ids.map((id, index) =>
-          delegate.update({ where: { id }, data: { sortOrder: index } }),
+          delegate.update({
+            where: { id },
+            data: { sortOrder: index, ...(actor ? { updatedBy: actor } : {}) },
+          }),
         ),
       )
 

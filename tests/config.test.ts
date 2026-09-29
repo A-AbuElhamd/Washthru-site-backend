@@ -85,7 +85,11 @@ describe('loadConfig', () => {
   })
 
   it('sets isProduction only in production', () => {
-    expect(loadConfig({ ...BASE, NODE_ENV: 'production' }).isProduction).toBe(true)
+    // Production additionally requires CORS_ORIGINS — see the block below.
+    expect(
+      loadConfig({ ...BASE, NODE_ENV: 'production', CORS_ORIGINS: 'https://x.test' })
+        .isProduction,
+    ).toBe(true)
     expect(loadConfig({ ...BASE, NODE_ENV: 'test' }).isProduction).toBe(false)
     expect(loadConfig({ ...BASE, NODE_ENV: 'test' }).isTest).toBe(true)
   })
@@ -95,6 +99,44 @@ describe('loadConfig', () => {
     expect(() =>
       loadConfig({ ...BASE, PATH: '/usr/bin', HOME: '/root' }),
     ).not.toThrow()
+  })
+})
+
+describe('loadConfig — production guardrails', () => {
+  it('requires CORS_ORIGINS in production', () => {
+    // Empty in production means the allowlist matches nothing and every browser
+    // request from the dashboard is blocked — with no symptom except a CORS
+    // error in the console that says nothing about the cause. Failing at boot
+    // with a clear message is far cheaper to diagnose.
+    expect(() => loadConfig({ ...BASE, NODE_ENV: 'production' })).toThrow(
+      /CORS_ORIGINS is required in production/,
+    )
+  })
+
+  it('does not require CORS_ORIGINS outside production', () => {
+    expect(() => loadConfig({ ...BASE, NODE_ENV: 'development' })).not.toThrow()
+  })
+
+  it('does not trust any proxy by default', () => {
+    // Trusting a proxy that is not there lets any client forge X-Forwarded-For
+    // and claim any IP, which would defeat the rate limiter entirely. Azure sets
+    // TRUST_PROXY_HOPS=1 explicitly.
+    expect(loadConfig({ ...BASE }).trustProxyHops).toBe(0)
+    expect(loadConfig({ ...BASE, TRUST_PROXY_HOPS: '1' }).trustProxyHops).toBe(1)
+  })
+
+  it('caps access token lifetime', () => {
+    // They cannot be revoked once issued, so a long-lived one widens the window
+    // in which a logged-out user still has access.
+    expect(() =>
+      loadConfig({ ...BASE, ACCESS_TOKEN_TTL_SECONDS: '86400' }),
+    ).toThrow(/short-lived/)
+  })
+
+  it('rejects a short JWT secret', () => {
+    expect(() => loadConfig({ ...BASE, JWT_SECRET: 'too-short' })).toThrow(
+      /at least 32 characters/,
+    )
   })
 })
 

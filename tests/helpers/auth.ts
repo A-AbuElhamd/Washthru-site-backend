@@ -30,7 +30,7 @@ export async function createTestUser(input: TestUserInput = {}) {
 
   return prisma.user.create({
     data: {
-      email: input.email ?? 'ahmed@washthru.test',
+      email: (input.email ?? 'ahmed@washthru.test').toLowerCase(),
       name: input.name ?? 'Ahmed',
       role: input.role ?? 'admin',
       passwordHash: await hashPassword(input.password ?? TEST_PASSWORD),

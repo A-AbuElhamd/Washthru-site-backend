@@ -20,6 +20,14 @@ import { hashRefreshToken } from '../src/auth/tokens.js'
 const prisma = getTestPrisma()
 const app = createTestApp()
 
+/** Pulls the raw refresh token out of a login response's Set-Cookie header. */
+function refreshTokenFrom(response: { headers: Record<string, unknown> }): string {
+  const cookies = response.headers['set-cookie'] as unknown as string[]
+  const cookie = cookies.find((c) => c.startsWith('refresh_token='))
+  if (!cookie) throw new Error('no refresh_token cookie in response')
+  return cookie.split('=')[1]!.split(';')[0]!
+}
+
 beforeEach(async () => {
   await clearAllTables(prisma)
 })
@@ -214,6 +222,37 @@ describe('refresh', () => {
     })
 
     await agent.post('/api/auth/refresh').expect(401)
+  })
+
+  it('revokes every session when a spent token is presented again', async () => {
+    // Reuse detection. A revoked token coming back means two parties hold the
+    // same one — the user rotated it, and someone else kept a copy. Without
+    // this the thief simply got a 401, the victim saw one "session expired" and
+    // logged back in, and the thief kept their own 30-day chain: the theft never
+    // surfaced.
+    const user = await createTestUser()
+    const agent = request.agent(app)
+
+    const login = await agent
+      .post('/api/auth/login')
+      .send({ email: user.email, password: TEST_PASSWORD })
+      .expect(200)
+
+    // Keep the ORIGINAL raw token — this is what a thief would have copied.
+    const stolen = refreshTokenFrom(login)
+
+    await agent.post('/api/auth/refresh').expect(200) // victim rotates; `stolen` is spent
+    expect(await prisma.refreshToken.count({ where: { revokedAt: null } })).toBe(1)
+
+    // The thief replays it.
+    await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', `refresh_token=${stolen}`)
+      .expect(401)
+
+    // Every session for that user is now dead — including the victim's, who
+    // must log in again, which is the safe outcome.
+    expect(await prisma.refreshToken.count({ where: { revokedAt: null } })).toBe(0)
   })
 
   it('rejects a made-up token', async () => {
